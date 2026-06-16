@@ -48,6 +48,32 @@ function mapStopReason(reason: string | null | undefined): StopReason {
   }
 }
 
+type AnthropicEffort = "low" | "medium" | "high" | "xhigh";
+
+/**
+ * Map a pi thinking level to an Anthropic adaptive-thinking effort, mirroring pi-ai's built-in
+ * provider (model thinkingLevelMap override, then a sane default).
+ */
+function mapThinkingLevelToEffort(
+  model: Model<Api>,
+  level: string | undefined,
+): AnthropicEffort {
+  const map = model.thinkingLevelMap as Record<string, string> | undefined;
+  const mapped = level ? map?.[level] : undefined;
+  if (typeof mapped === "string") return mapped as AnthropicEffort;
+  switch (level) {
+    case "minimal":
+    case "low":
+      return "low";
+    case "medium":
+      return "medium";
+    case "high":
+      return "high";
+    default:
+      return "high";
+  }
+}
+
 function makeDefaultHeaders(
   isOAuth: boolean,
   options?: SimpleStreamOptions,
@@ -152,24 +178,50 @@ export function streamAnthropicOAuth(
         params.tools = convertPiToolsToAnthropic(context.tools, isOAuth);
 
       if (options?.reasoning && model.reasoning && maxTokens > 1) {
-        const defaultBudgets: Record<string, number> = {
-          minimal: 1024,
-          low: 4096,
-          medium: 10240,
-          high: 20480,
-          xhigh: 32000,
+        // Request readable ("summarized") thinking. Anthropic's default thinking display for
+        // ADAPTIVE models is "omitted" — an empty `thinking` field with the reasoning encrypted in
+        // the signature — which is why thinking text never rendered on the OAuth path. pi-ai's
+        // built-in provider sets `display` explicitly; mirror it so subscription thinking is visible.
+        const display = "summarized";
+        const extended = params as MessageCreateParamsStreaming & {
+          output_config?: { effort: AnthropicEffort };
         };
-        const customBudget =
-          options.thinkingBudgets?.[
-            options.reasoning as keyof typeof options.thinkingBudgets
-          ];
-        const requestedBudget =
-          customBudget ?? defaultBudgets[options.reasoning] ?? 10240;
 
-        params.thinking = {
-          type: "enabled",
-          budget_tokens: Math.min(requestedBudget, maxTokens - 1),
-        };
+        const isAdaptive =
+          (model.compat as { forceAdaptiveThinking?: boolean } | undefined)
+            ?.forceAdaptiveThinking === true;
+
+        if (isAdaptive) {
+          // Adaptive thinking models (Opus 4.x, Sonnet 4.x, Fable 5): Claude sizes its own thinking
+          // from an effort level rather than a fixed token budget.
+          extended.thinking = {
+            type: "adaptive",
+            display,
+          } as unknown as MessageCreateParamsStreaming["thinking"];
+          extended.output_config = {
+            effort: mapThinkingLevelToEffort(model, options.reasoning),
+          };
+        } else {
+          const defaultBudgets: Record<string, number> = {
+            minimal: 1024,
+            low: 4096,
+            medium: 10240,
+            high: 20480,
+            xhigh: 32000,
+          };
+          const customBudget =
+            options.thinkingBudgets?.[
+              options.reasoning as keyof typeof options.thinkingBudgets
+            ];
+          const requestedBudget =
+            customBudget ?? defaultBudgets[options.reasoning] ?? 10240;
+
+          extended.thinking = {
+            type: "enabled",
+            budget_tokens: Math.min(requestedBudget, maxTokens - 1),
+            display,
+          } as unknown as MessageCreateParamsStreaming["thinking"];
+        }
       }
 
       // Raw stream instead of the MessageStream helper: MessageStream

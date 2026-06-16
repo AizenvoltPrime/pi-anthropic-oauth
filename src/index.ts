@@ -21,7 +21,7 @@ const DEFAULT_OPUS_4_8: NonNullable<ProviderConfig["models"]>[number] = {
   cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
   contextWindow: 1000000,
   maxTokens: 128000,
-  compat: undefined,
+  compat: { forceAdaptiveThinking: true },
 };
 
 function ensureClaudeCodeSymlink() {
