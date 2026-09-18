@@ -47,6 +47,14 @@ pi update npm:pi-anthropic-oauth
 > [!NOTE]
 > Anthropic auth changes are closely monitored for quick compatibility updates.
 
+## Claude Code version override
+
+If Anthropic requires a newer Claude Code version, override the version sent in the OAuth user agent:
+
+```bash
+PI_ANTHROPIC_OAUTH_CLAUDE_CODE_VERSION=2.1.275
+```
+
 ## System prompt rewriting
 
 When using Claude Pro/Max OAuth, the extension prepends Claude Code identity text and rewrites standalone `Pi` / `pi` references in Pi's system prompt to `Claude Code`. The rewrite mode defaults to `aggressive`:
