@@ -34,18 +34,35 @@ const REQUIRED_BETAS = [
   "interleaved-thinking-2025-05-14",
 ] as const;
 
-function mapStopReason(reason: string | null | undefined): StopReason {
+// Lets a managed-effort model drop a thinking block whose prefix changed instead of rejecting the
+// request. This provider replays the latest system prompt and tools at the top of every request, so
+// any mid-session prompt or tool change is such a prefix change.
+const THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01";
+
+function isManagedEffortModel(model: Model<Api>): boolean {
+  return (model.compat as { supportsMidConvoEffort?: boolean } | undefined)?.supportsMidConvoEffort === true;
+}
+
+function mapStopReason(
+  reason: string | null | undefined,
+  stopDetails: { explanation?: string } | null | undefined,
+): { stopReason: StopReason; errorMessage?: string } {
   switch (reason) {
     case "end_turn":
     case "pause_turn":
     case "stop_sequence":
-      return "stop";
+      return { stopReason: "stop" };
     case "max_tokens":
-      return "length";
+      return { stopReason: "length" };
     case "tool_use":
-      return "toolUse";
+      return { stopReason: "toolUse" };
+    case "refusal":
+      return {
+        stopReason: "error",
+        errorMessage: stopDetails?.explanation || "The model refused to complete the request",
+      };
     default:
-      return "error";
+      return { stopReason: "error", errorMessage: `Provider stopped with: ${reason}` };
   }
 }
 
@@ -59,6 +76,7 @@ function headersToRecord(headers: Headers): Record<string, string> {
 
 function makeDefaultHeaders(
   isOAuth: boolean,
+  model: Model<Api>,
   options?: SimpleStreamOptions,
 ): Record<string, string> {
   const headers: Record<string, string> = {
@@ -66,12 +84,13 @@ function makeDefaultHeaders(
     "anthropic-dangerous-direct-browser-access": "true",
   };
 
+  const modelBetas = isManagedEffortModel(model) ? [THINKING_BINDING_BETA] : [];
   if (isOAuth) {
-    headers["anthropic-beta"] = REQUIRED_BETAS.join(",");
+    headers["anthropic-beta"] = [...REQUIRED_BETAS, ...modelBetas].join(",");
     headers["user-agent"] = USER_AGENT;
     headers["x-app"] = "cli";
   } else {
-    headers["anthropic-beta"] = ["interleaved-thinking-2025-05-14"].join(",");
+    headers["anthropic-beta"] = ["interleaved-thinking-2025-05-14", ...modelBetas].join(",");
   }
 
   if (options?.headers) {
@@ -92,6 +111,16 @@ function makeDefaultHeaders(
   }
 
   return headers;
+}
+
+/** The effort a pi thinking level maps to on an adaptive-thinking model, via the model's own map. */
+function adaptiveEffort(model: Model<Api>, reasoning: string | undefined): string {
+  if (!reasoning) return "high";
+  const mapped = model.thinkingLevelMap?.[reasoning as keyof NonNullable<Model<Api>["thinkingLevelMap"]>];
+  if (typeof mapped === "string") return mapped;
+  if (reasoning === "minimal" || reasoning === "low") return "low";
+  if (reasoning === "medium") return "medium";
+  return "high";
 }
 
 export function streamAnthropicOAuth(
@@ -129,7 +158,7 @@ export function streamAnthropicOAuth(
       }
 
       const isOAuth = isClaudeOAuthAccessToken(apiKey);
-      const defaultHeaders = makeDefaultHeaders(isOAuth, options);
+      const defaultHeaders = makeDefaultHeaders(isOAuth, model, options);
 
       if (isOAuth) defaultHeaders.authorization = `Bearer ${apiKey}`;
 
@@ -141,8 +170,8 @@ export function streamAnthropicOAuth(
         dangerouslyAllowBrowser: true,
       });
 
-      const maxTokens =
-        options?.maxTokens || Math.floor(model.maxTokens / 3);
+      // Thinking counts toward this limit, so a fraction of the model's cap cuts long turns off.
+      const maxTokens = options?.maxTokens || model.maxTokens;
 
       // The prompt and the tool loadout are carried by the transcript's system messages, which
       // `convertPiMessagesToAnthropic` skips. Replay them here or the request goes out with neither.
@@ -163,7 +192,20 @@ export function streamAnthropicOAuth(
       if (tools.length > 0)
         params.tools = convertPiToolsToAnthropic(tools, isOAuth);
 
-      if (options?.reasoning && model.reasoning && maxTokens > 1) {
+      // Anthropic's default thinking display for adaptive models is "omitted": an empty `thinking`
+      // field with the reasoning encrypted in the signature, so thinking text never renders.
+      const display = "summarized";
+      if (isManagedEffortModel(model)) {
+        // These models cannot turn thinking off; with no level requested pi's provider sends "high".
+        params.thinking = {
+          type: "adaptive",
+          display,
+          block_binding: { prefix_mismatch_behavior: "drop_block" },
+        } as never;
+        Object.assign(params, {
+          output_config: { effort: adaptiveEffort(model, options?.reasoning) },
+        });
+      } else if (options?.reasoning && model.reasoning && maxTokens > 1) {
         const defaultBudgets: Record<string, number> = {
           minimal: 1024,
           low: 4096,
@@ -177,10 +219,6 @@ export function streamAnthropicOAuth(
           ];
         const requestedBudget =
           customBudget ?? defaultBudgets[options.reasoning] ?? 10240;
-        // Anthropic's default thinking display for adaptive models is "omitted": an empty
-        // `thinking` field with the reasoning encrypted in the signature, so thinking text never
-        // renders. pi-ai's built-in provider sets `display` explicitly; mirror it.
-        const display = "summarized";
         const forceAdaptive = (
           model.compat as { forceAdaptiveThinking?: boolean } | undefined
         )?.forceAdaptiveThinking;
@@ -194,19 +232,10 @@ export function streamAnthropicOAuth(
               )));
 
         if (adaptive) {
-          const mapped = model.thinkingLevelMap?.[options.reasoning];
-          const effort =
-            typeof mapped === "string"
-              ? mapped
-              : options.reasoning === "minimal" || options.reasoning === "low"
-                ? "low"
-                : options.reasoning === "medium"
-                  ? "medium"
-                  : options.reasoning === "high"
-                    ? "high"
-                    : "high";
           params.thinking = { type: "adaptive", display } as never;
-          Object.assign(params, { output_config: { effort } });
+          Object.assign(params, {
+            output_config: { effort: adaptiveEffort(model, options.reasoning) },
+          });
         } else {
           params.thinking = {
             type: "enabled",
@@ -214,6 +243,9 @@ export function streamAnthropicOAuth(
             display,
           } as never;
         }
+      } else if (!options?.reasoning && model.reasoning && model.thinkingLevelMap?.off !== null) {
+        // Omitting `thinking` leaves a 5-generation model thinking by default, so "off" must be sent.
+        params.thinking = { type: "disabled" } as never;
       }
 
       // Raw stream instead of the MessageStream helper: MessageStream
@@ -414,7 +446,11 @@ export function streamAnthropicOAuth(
         }
 
         if (event.type === "message_delta") {
-          output.stopReason = mapStopReason(event.delta.stop_reason);
+          const stopDetails = (event.delta as { stop_details?: { explanation?: string } }).stop_details;
+          if (event.delta.stop_reason) output.rawStopReason = event.delta.stop_reason;
+          const mapped = mapStopReason(event.delta.stop_reason, stopDetails);
+          output.stopReason = mapped.stopReason;
+          if (mapped.errorMessage) output.errorMessage = mapped.errorMessage;
           output.usage.input =
             (event.usage as { input_tokens?: number }).input_tokens ||
             output.usage.input;
@@ -445,6 +481,9 @@ export function streamAnthropicOAuth(
       }
 
       if (options?.signal?.aborted) throw new Error("Request aborted");
+      if (output.stopReason === "error") {
+        throw new Error(output.errorMessage || "An unknown error occurred");
+      }
       stream.push({
         type: "done",
         reason: output.stopReason as "stop" | "length" | "toolUse",

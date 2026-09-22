@@ -47,9 +47,16 @@ const MODEL = {
 };
 
 /** Run one request against a throwaway server and return the JSON body the provider sent. */
-async function capture(context) {
+async function capture(context, { model: modelOverride, options } = {}) {
+  return (await captureRequest(context, { model: modelOverride, options })).body;
+}
+
+/** As `capture`, but also returns the request headers. */
+async function captureRequest(context, { model: modelOverride, options } = {}) {
   let body;
+  let headers;
   const server = http.createServer((req, res) => {
+    headers = req.headers;
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
@@ -64,16 +71,16 @@ async function capture(context) {
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const model = { ...MODEL, baseUrl: `http://127.0.0.1:${server.address().port}` };
+  const model = { ...(modelOverride ?? MODEL), baseUrl: `http://127.0.0.1:${server.address().port}` };
   try {
-    await streamAnthropicOAuth(model, context, {
+    await streamAnthropicOAuth(model, context, options ?? {
       apiKey: "sk-ant-oat01-test",
       reasoning: "high",
     }).result();
   } finally {
     server.close();
   }
-  return body;
+  return { body, headers };
 }
 
 /** A transcript the way the agent loop builds one: tools declared on the leading system message. */
