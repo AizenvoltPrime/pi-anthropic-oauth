@@ -17,7 +17,9 @@ const SCOPES = [
   "user:file_upload",
 ].join(" ");
 const CLAUDE_CODE_VERSION_ENV = "PI_ANTHROPIC_OAUTH_CLAUDE_CODE_VERSION";
-const DEFAULT_CLAUDE_CODE_VERSION = "2.1.251";
+// Anthropic gates new models on this version: claude-opus-5-5 rejects anything below 2.1.280. Raise it
+// when a model starts returning `claude_code_version_too_old`.
+const DEFAULT_CLAUDE_CODE_VERSION = "2.1.280";
 const USER_AGENT = makeClaudeCodeUserAgent();
 const CALLBACK_PORT = 53692;
 const CALLBACK_HOST = "127.0.0.1";
