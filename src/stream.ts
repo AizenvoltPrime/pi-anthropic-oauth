@@ -15,6 +15,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { isClaudeOAuthAccessToken, USER_AGENT } from "./auth.js";
 import {
+  type CacheControl,
   convertPiMessagesToAnthropic,
   convertPiToolsToAnthropic,
   fromClaudeCodeToolName,
@@ -38,6 +39,7 @@ const REQUIRED_BETAS = [
 // request. This provider replays the latest system prompt and tools at the top of every request, so
 // any mid-session prompt or tool change is such a prefix change.
 const THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01";
+const MID_CONVERSATION_OUTPUT_CONFIG_BETA = "mid-conversation-output-config-2026-07-01";
 
 function isManagedEffortModel(model: Model<Api>): boolean {
   return (model.compat as { supportsMidConvoEffort?: boolean } | undefined)?.supportsMidConvoEffort === true;
@@ -84,7 +86,9 @@ function makeDefaultHeaders(
     "anthropic-dangerous-direct-browser-access": "true",
   };
 
-  const modelBetas = isManagedEffortModel(model) ? [THINKING_BINDING_BETA] : [];
+  const modelBetas = isManagedEffortModel(model)
+    ? [MID_CONVERSATION_OUTPUT_CONFIG_BETA, THINKING_BINDING_BETA]
+    : [];
   if (isOAuth) {
     headers["anthropic-beta"] = [...REQUIRED_BETAS, ...modelBetas].join(",");
     headers["user-agent"] = USER_AGENT;
@@ -123,6 +127,16 @@ function adaptiveEffort(model: Model<Api>, reasoning: string | undefined): strin
   return "high";
 }
 
+function resolveCacheControl(model: Model<Api>, options?: SimpleStreamOptions): CacheControl | null {
+  const retention =
+    options?.cacheRetention ??
+    ((options?.env?.PI_CACHE_RETENTION || process.env.PI_CACHE_RETENTION) === "long" ? "long" : "short");
+  if (retention === "none") return null;
+  const supportsLong =
+    (model.compat as { supportsLongCacheRetention?: boolean } | undefined)?.supportsLongCacheRetention ?? true;
+  return retention === "long" && supportsLong ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" };
+}
+
 export function streamAnthropicOAuth(
   model: Model<Api>,
   context: TranscriptContext,
@@ -148,6 +162,7 @@ export function streamAnthropicOAuth(
       stopReason: "stop",
       timestamp: Date.now(),
     };
+    if (isManagedEffortModel(model)) output.providerThinkingLevel = adaptiveEffort(model, options?.reasoning);
 
     try {
       const apiKey = options?.apiKey;
@@ -177,9 +192,16 @@ export function streamAnthropicOAuth(
       // `convertPiMessagesToAnthropic` skips. Replay them here or the request goes out with neither.
       const tools = getCurrentTools(context.messages);
 
+      const cacheControl = resolveCacheControl(model, options);
       const params: MessageCreateParamsStreaming = {
         model: model.id,
-        messages: convertPiMessagesToAnthropic(context.messages, isOAuth, model),
+        messages: convertPiMessagesToAnthropic(
+          context.messages,
+          isOAuth,
+          model,
+          cacheControl,
+          output.providerThinkingLevel,
+        ),
         max_tokens: maxTokens,
         stream: true,
       };
@@ -187,6 +209,7 @@ export function streamAnthropicOAuth(
       const system = buildAnthropicSystemPrompt(
         getCurrentSystemPrompt(context.messages),
         isOAuth,
+        cacheControl,
       );
       if (system) params.system = system as never;
       if (tools.length > 0)
@@ -202,9 +225,8 @@ export function streamAnthropicOAuth(
           display,
           block_binding: { prefix_mismatch_behavior: "drop_block" },
         } as never;
-        Object.assign(params, {
-          output_config: { effort: adaptiveEffort(model, options?.reasoning) },
-        });
+        // Anthropic renders this into the prompt, so it stays fixed; the real level rides in messages.
+        Object.assign(params, { output_config: { effort: "high" } });
       } else if (options?.reasoning && model.reasoning && maxTokens > 1) {
         const defaultBudgets: Record<string, number> = {
           minimal: 1024,

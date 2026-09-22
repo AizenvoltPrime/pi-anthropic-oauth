@@ -59,7 +59,7 @@ const CONTEXT = {
 };
 
 /** Serve one request: record it, answer with `respond`, return what was sent and what came back. */
-async function exchange(model, options, respond) {
+async function exchange(model, options, respond, context = CONTEXT) {
   let body;
   let headers;
   const server = http.createServer((req, res) => {
@@ -75,7 +75,7 @@ async function exchange(model, options, respond) {
   try {
     const result = await streamAnthropicOAuth(
       { ...model, baseUrl: `http://127.0.0.1:${server.address().port}` },
-      CONTEXT,
+      context,
       { apiKey: "sk-ant-oat01-test", ...options },
     ).result();
     return { body, headers, result };
@@ -100,7 +100,7 @@ function sse(events) {
 for (const level of ["low", "medium", "high", "xhigh", "max"]) {
   test(`Opus 5.5 at ${level} sends that effort, not a collapsed one`, async () => {
     const { body } = await exchange(OPUS_55, { reasoning: level }, reject);
-    assert.deepEqual(body.output_config, { effort: level });
+    assert.deepEqual(body.messages.at(-1).output_config, { effort: level });
     assert.equal(body.thinking.type, "adaptive");
     assert.equal(body.thinking.display, "summarized");
   });
@@ -175,4 +175,110 @@ test("a refusal surfaces as an error carrying Anthropic's explanation", async ()
   assert.equal(result.stopReason, "error");
   assert.equal(result.errorMessage, "Declined: reasoning extraction.");
   assert.equal(result.rawStopReason, "refusal");
+});
+
+const EMPTY_SSE = sse([
+  {
+    type: "message_start",
+    message: {
+      id: "msg_1",
+      type: "message",
+      role: "assistant",
+      model: "claude-opus-5-5",
+      content: [],
+      stop_reason: null,
+      usage: { input_tokens: 1, output_tokens: 0 },
+    },
+  },
+  { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+  { type: "message_stop" },
+]);
+
+function assistant(text, provider, level) {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text }],
+    api: "anthropic-messages",
+    provider,
+    model: "claude-opus-5-5",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: 2,
+    ...(level ? { providerThinkingLevel: level } : {}),
+  };
+}
+
+// Anthropic renders top-level effort into the prompt, so changing it would drop the cached prefix.
+test("Opus 5.5 at xhigh pins top-level effort to high and carries xhigh in a trailing system message", async () => {
+  const { body, headers } = await exchange(OPUS_55, { reasoning: "xhigh" }, reject);
+  assert.deepEqual(body.output_config, { effort: "high" });
+  assert.deepEqual(body.messages.at(-1), { role: "system", content: [], output_config: { effort: "xhigh" } });
+  assert.match(headers["anthropic-beta"], /mid-conversation-output-config-2026-07-01/);
+  assert.equal(body.messages.at(-2).content.at(-1).cache_control.type, "ephemeral", "breakpoint stays on the last user block");
+});
+
+test("Opus 5.5 replays a stamped assistant level before that message, and none for another provider", async () => {
+  const context = {
+    messages: [
+      { role: "system", content: "SYSTEM", timestamp: 0 },
+      { role: "user", content: [{ type: "text", text: "one" }], timestamp: 1 },
+      assistant("mine", "anthropic", "low"),
+      { role: "user", content: [{ type: "text", text: "two" }], timestamp: 3 },
+      assistant("theirs", "other", "medium"),
+      { role: "user", content: [{ type: "text", text: "three" }], timestamp: 5 },
+    ],
+  };
+  const { body } = await exchange(OPUS_55, { reasoning: "high" }, reject, context);
+  const roles = body.messages.map((m) => m.role);
+  assert.deepEqual(roles, ["user", "system", "assistant", "user", "assistant", "user", "system"]);
+  assert.deepEqual(body.messages[1], { role: "system", content: [], output_config: { effort: "low" } });
+  assert.deepEqual(body.messages[6].output_config, { effort: "high" });
+});
+
+test("Opus 5.5 stamps the requested level on the output message", async () => {
+  const { result } = await exchange(OPUS_55, { reasoning: "medium" }, EMPTY_SSE);
+  assert.equal(result.stopReason, "stop");
+  assert.equal(result.providerThinkingLevel, "medium");
+});
+
+test("Sonnet 5 keeps its level at top level with no inserted system messages", async () => {
+  const context = { messages: [...CONTEXT.messages, assistant("x", "anthropic", "low"), { role: "user", content: "again", timestamp: 3 }] };
+  const { body, headers } = await exchange(SONNET_5, { reasoning: "medium" }, reject, context);
+  assert.deepEqual(body.output_config, { effort: "medium" });
+  assert.ok(body.messages.every((m) => m.role !== "system"));
+  assert.doesNotMatch(headers["anthropic-beta"], /mid-conversation-output-config/);
+});
+
+function cacheControls(body) {
+  const found = [];
+  const walk = (value) => {
+    if (Array.isArray(value)) value.forEach(walk);
+    else if (value && typeof value === "object") {
+      if (value.cache_control) found.push(value.cache_control);
+      Object.values(value).forEach(walk);
+    }
+  };
+  walk(body);
+  return found;
+}
+
+test("cache retention: PI_CACHE_RETENTION=long gives 1h, none gives no cache_control, default is plain ephemeral", async () => {
+  const saved = process.env.PI_CACHE_RETENTION;
+  try {
+    process.env.PI_CACHE_RETENTION = "long";
+    const long = cacheControls((await exchange(SONNET_5, {}, reject)).body);
+    assert.equal(long.length, 3, "identity, system prompt, last user block");
+    for (const c of long) assert.deepEqual(c, { type: "ephemeral", ttl: "1h" });
+
+    const none = cacheControls((await exchange(SONNET_5, { cacheRetention: "none" }, reject)).body);
+    assert.equal(none.length, 0);
+
+    delete process.env.PI_CACHE_RETENTION;
+    const short = cacheControls((await exchange(SONNET_5, {}, reject)).body);
+    assert.equal(short.length, 3);
+    for (const c of short) assert.deepEqual(c, { type: "ephemeral" });
+  } finally {
+    if (saved === undefined) delete process.env.PI_CACHE_RETENTION;
+    else process.env.PI_CACHE_RETENTION = saved;
+  }
 });

@@ -72,8 +72,11 @@ export function convertPiMessagesToAnthropic(
   messages: Message[],
   isOAuth: boolean,
   model: Pick<Model<Api>, "provider" | "api" | "id">,
+  cacheControl: CacheControl | null = { type: "ephemeral" },
+  activeEffort?: string,
 ): MessageParam[] {
   const params: MessageParam[] = [];
+  const assistantLevels = new Map<number, string>();
   const toolIdMap = new Map<string, string>();
   const usedToolIds = new Set<string>();
 
@@ -191,6 +194,14 @@ export function convertPiMessagesToAnthropic(
         }
       }
       if (blocks.length > 0) {
+        if (
+          activeEffort !== undefined &&
+          message.api === "anthropic-messages" &&
+          message.provider === model.provider &&
+          isAnthropicEffort(message.providerThinkingLevel)
+        ) {
+          assistantLevels.set(params.length, message.providerThinkingLevel);
+        }
         params.push({ role: "assistant", content: blocks });
         pendingToolUseIds = emittedToolUseIds;
       }
@@ -246,12 +257,32 @@ export function convertPiMessagesToAnthropic(
   }
 
   const last = params.at(-1);
-  if (last?.role === "user" && Array.isArray(last.content) && last.content.length > 0) {
-    const lastBlock = last.content[last.content.length - 1] as { cache_control?: { type: string } };
-    lastBlock.cache_control = { type: "ephemeral" };
+  if (cacheControl && last?.role === "user" && Array.isArray(last.content) && last.content.length > 0) {
+    const lastBlock = last.content[last.content.length - 1] as { cache_control?: CacheControl };
+    lastBlock.cache_control = cacheControl;
   }
 
-  return params;
+  if (activeEffort === undefined) return params;
+  // Effort rides in per-message system messages so the cached prefix survives a level change.
+  // The breakpoint stays on the last user block above; the trailing effort message has no content.
+  const withLevels: MessageParam[] = [];
+  params.forEach((param, index) => {
+    const level = assistantLevels.get(index);
+    if (level !== undefined) withLevels.push(effortMessage(level));
+    withLevels.push(param);
+  });
+  withLevels.push(effortMessage(activeEffort));
+  return withLevels;
+}
+
+export type CacheControl = { type: "ephemeral"; ttl?: "1h" };
+
+function isAnthropicEffort(value: string | undefined): value is string {
+  return value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max";
+}
+
+function effortMessage(effort: string): MessageParam {
+  return { role: "system", content: [], output_config: { effort } } as unknown as MessageParam;
 }
 
 export function convertPiToolsToAnthropic(tools: Tool[], isOAuth: boolean): ToolUnion[] {

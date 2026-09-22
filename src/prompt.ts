@@ -46,6 +46,7 @@ export function sanitizeSurrogates(text: string): string {
 export function buildAnthropicSystemPrompt(
   systemPrompt: string | undefined,
   isOAuth: boolean,
+  cacheControl: { type: "ephemeral"; ttl?: "1h" } | null = { type: "ephemeral" },
 ): MessageContentBlock[] | undefined {
   const blocks: MessageContentBlock[] = [];
 
@@ -53,7 +54,7 @@ export function buildAnthropicSystemPrompt(
     blocks.push({
       type: "text",
       text: CLAUDE_CODE_IDENTITY,
-      cache_control: { type: "ephemeral" },
+      ...(cacheControl ? { cache_control: cacheControl } : {}),
     });
   }
 
@@ -62,7 +63,7 @@ export function buildAnthropicSystemPrompt(
     blocks.push({
       type: "text",
       text: sanitized,
-      cache_control: { type: "ephemeral" },
+      ...(cacheControl ? { cache_control: cacheControl } : {}),
     });
   }
 
